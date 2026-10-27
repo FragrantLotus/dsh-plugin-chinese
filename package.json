@@ -1,0 +1,39 @@
+{
+  "name": "dsh-plugin-chinese",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "给每个已安装的 DSH 插件自动补上中文功能简介。插件名一律保持原样，只翻译简介，方便按名字找插件。",
+  "license": "MIT",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "cordis",
+    "chinese",
+    "i18n",
+    "汉化",
+    "中文"
+  ],
+  "engines": {
+    "dsh": ">=0.2.0-rc.1"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/schemastery": "*"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
