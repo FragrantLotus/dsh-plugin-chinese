@@ -1,0 +1,5 @@
+{
+  "meta": {
+    "description": "Automatically gives every installed DSH plugin a Chinese description. Plugin names stay exactly as they are, so you can still find them by name."
+  }
+}
