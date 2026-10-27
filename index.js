@@ -16,6 +16,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync,
 import { dirname, join, resolve as resolvePath } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import Schema from '@deepseek-ai/schemastery'
+import { createInjector, languagePacksOf, metaFromPacks, packageNameOf } from './inject.js'
 
 export const name = 'auto-i18n'
 
@@ -28,8 +29,23 @@ export const inject = []
 /** 中文判定：出现这些区间的字符就当它已经是中文，无需再翻。 */
 const CJK = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/
 
-/** 一句话里有这么多汉字，就认为它是中文写的（英文术语占比高也不影响判断）。 */
+/** 一句话里至少要有这么多汉字，才有资格被当成中文（纯英文的 0 个直接排除）。 */
 const CJK_ENOUGH = 4
+
+/** 拉丁字母：用来算中文占比，避免「英文长句里夹几个中文词」被误判为中文。 */
+const LATIN = /[A-Za-z]/
+
+/**
+ * 汉字占（汉字 + 拉丁字母）的比例达到这个数，就算「这段描述本来就是中文写的」。
+ *
+ * 这个数是从本机真实样本上量出来的，不是拍的：
+ *   dsh-sidebar-entries 0.05  ← 英文长句 + 结尾几个中文词，必须翻
+ *   dshmarket           0.15  ← 中英两句并列，作者自己写了 zh.json
+ *   dsh-onebot-qq       0.27  ← 中文为主、尾部拖一段英文
+ *   @a9i5k4/dsh-literature 0.57、dsh-cite 0.69、dsh-bili-scroll 0.88 ← 纯中文
+ * 取 0.12 正好落在「英文长句夹中文」和「中英并列」之间。
+ */
+const CJK_SHARE = 0.12
 
 /** 译文最长多少字符时送去翻译，超过就按句子切段。 */
 const CHUNK = 900
@@ -63,14 +79,30 @@ export function polishDescription(text) {
   return out
 }
 
+/**
+ * 判断一段描述是不是「已经是中文」。
+ *
+ * 早期版本只看汉字个数（>= 4 就算），结果被 `dsh-sidebar-entries` 骗了：
+ * 它是一整句英文，末尾带「文献 / 插件市场 / 远程访问」几个词，汉字数刚好 10 个，
+ * 于是被判成中文、整包跳过，界面就一直显示英文。
+ *
+ * 现在的判据是「中文得占到一定比重」：汉字 / (汉字 + 拉丁字母) >= CJK_SHARE。
+ * 实测分界很清楚 —— sidebar-entries 0.05（英文长句夹几个中文词，该翻），
+ * dshmarket 0.15、dsh-onebot-qq 0.27（中英并列或中文为主，不该翻）。
+ *
+ * 判断错了不会破坏文件：漏判只是多翻一次，误判才会让界面留着英文，
+ * 所以阈值取偏保守的低位。
+ */
 export function isChinese(text) {
   if (typeof text !== 'string' || text.trim() === '') return false
   let hits = 0
+  let latin = 0
   for (const ch of text) {
     if (CJK.test(ch)) hits += 1
-    if (hits >= CJK_ENOUGH) return true
+    else if (LATIN.test(ch)) latin += 1
   }
-  return false
+  if (hits < CJK_ENOUGH) return false
+  return hits / (hits + latin) >= CJK_SHARE
 }
 
 function readJson(path, fallback) {
@@ -364,6 +396,46 @@ export function apply(ctx, config = {}) {
   let running = false
   let timer
 
+  /**
+   * 内存注入层要用的「包名 → 中文元信息」查询。
+   *
+   * 直接读磁盘语言包，**不走 Node 模块解析** —— 这正是绕开解析缓存的关键：
+   * 包里有没有 `exports['./locale/*.json']` 都不影响这里能不能读到。
+   * 按 (package.json, locale/*.json) 的 mtime 做失效，文件一变下次取就是新的。
+   */
+  const packCache = new Map()
+
+  function stampOf(paths) {
+    let latest = 0
+    for (const path of paths) {
+      try {
+        latest = Math.max(latest, statSync(path).mtimeMs)
+      } catch {
+        /* 文件不存在是常态（新装的包还没写语言包） */
+      }
+    }
+    return latest
+  }
+
+  function lookup(name) {
+    const packageName = packageNameOf(name)
+    if (packageName === undefined || packageName === 'dsh-plugin-chinese') return undefined
+    const packageDir = join(profileDir, 'node_modules', ...packageName.split('/'))
+    const manifestPath = join(packageDir, 'package.json')
+    if (!existsSync(manifestPath)) return undefined
+
+    const localeDir = existsSync(join(packageDir, 'locales')) ? 'locales' : 'locale'
+    const stamp = stampOf([manifestPath, join(packageDir, localeDir)])
+    const hit = packCache.get(packageName)
+    if (hit !== undefined && hit.stamp === stamp) return hit.meta
+
+    const meta = metaFromPacks(languagePacksOf(packageDir))
+    packCache.set(packageName, { stamp, meta })
+    return meta
+  }
+
+  const injector = createInjector({ lookup, log: (message) => logLine(logPath, message) })
+
   async function once(reason) {
     if (running) return
     running = true
@@ -378,7 +450,15 @@ export function apply(ctx, config = {}) {
         log: (m) => logLine(logPath, m),
         config: settings,
       })
-      writeJsonAtomic(reportPath, { at: new Date().toISOString(), reason, ...report })
+      // 新写的语言包要立刻出现在界面上：丢掉注入层的缓存。
+      packCache.clear()
+      writeJsonAtomic(reportPath, {
+        at: new Date().toISOString(),
+        reason,
+        ...report,
+        inject: injector.status,
+        injectCalls: injector.counters,
+      })
       const done = report.translated.length
       if (done > 0 || report.failed.length > 0) {
         logLine(
@@ -398,12 +478,47 @@ export function apply(ctx, config = {}) {
   const kickoff = setTimeout(() => void once('startup'), 4_000)
   kickoff.unref?.()
 
+  // 注入层稍晚一点装：等 pluginPackages / pluginManager 都就位。
+  const injectTimers = [3_000, 8_000, 20_000].map((delay) => {
+    const handle = setTimeout(() => {
+      injector.install(ctx)
+      if (!injector.anyInstalled) logLine(logPath, 'inject: 还没有可挂载的服务，稍后重试')
+    }, delay)
+    handle.unref?.()
+    return handle
+  })
+
+  // 自检探针：光看计数器只能证明「皮被调到了」，证明不了「拿到的 meta 真是中文」。
+  // 所以这里自己调一次 listBundles，直接数返回结果里有几条带 zh。
+  let lastCalls = -1
+  let lastProbeHits = -1
+  const callWatch = setInterval(() => {
+    void (async () => {
+      if (!injector.anyInstalled) return
+      const counts = injector.counters
+      const total = Object.values(counts).reduce((sum, n) => sum + n, 0)
+      const result = await injector.probe()
+      const line =
+        `inject 自检: 调用合计 ${total} 次 ` +
+        `[${Object.entries(counts).map(([k, v]) => `${k}=${v}`).join(', ')}]` +
+        ` / 探针 ${result.service} 自增 ${result.calls} 次、${result.hit}/${result.total} 条带 zh`
+      if (total === lastCalls && result.hit === lastProbeHits) return
+      lastCalls = total
+      lastProbeHits = result.hit
+      logLine(logPath, result.hit > 0 ? line : `${line} —— 注入没落地`)
+    })()
+  }, 60_000)
+  callWatch.unref?.()
+
   ctx.effect(() => {
     timer = setInterval(() => void once('interval'), settings.intervalMinutes * 60_000)
     timer.unref?.()
     return () => {
       clearTimeout(kickoff)
+      clearInterval(callWatch)
       clearInterval(timer)
+      for (const handle of injectTimers) clearTimeout(handle)
+      injector.dispose()
     }
   }, 'auto-i18n.schedule()')
 
