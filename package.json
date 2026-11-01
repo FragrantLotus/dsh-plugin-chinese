@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-chinese",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "type": "module",
   "description": "给每个已安装的 DSH 插件自动补上中文功能简介。插件名一律保持原样，只翻译简介，方便按名字找插件。",
   "license": "MIT",
@@ -15,6 +15,7 @@
   "exports": {
     ".": "./index.js",
     "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
     "./package.json": "./package.json"
   },
   "files": [
@@ -22,6 +23,8 @@
     "inject.js",
     "cordis.patch.yml",
     "locale/*.json",
+    "icon.svg",
+    "docs/*.png",
     "README.md",
     "LICENSE"
   ],
@@ -44,5 +47,6 @@
     "bundle": {
       "patch": "./cordis.patch.yml"
     }
-  }
+  },
+  "icon": "icon.svg"
 }
