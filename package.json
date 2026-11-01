@@ -1,9 +1,17 @@
 {
   "name": "dsh-plugin-chinese",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "type": "module",
   "description": "给每个已安装的 DSH 插件自动补上中文功能简介。插件名一律保持原样，只翻译简介，方便按名字找插件。",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/FragrantLotus/dsh-plugin-chinese.git"
+  },
+  "homepage": "https://github.com/FragrantLotus/dsh-plugin-chinese#readme",
+  "bugs": {
+    "url": "https://github.com/FragrantLotus/dsh-plugin-chinese/issues"
+  },
   "exports": {
     ".": "./index.js",
     "./locale/*.json": "./locale/*.json",
