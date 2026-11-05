@@ -15,6 +15,7 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve as resolvePath } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { createHash } from 'node:crypto'
 import Schema from '@deepseek-ai/schemastery'
 import { createInjector, languagePacksOf, metaFromPacks, packageNameOf } from './inject.js'
 
@@ -515,6 +516,7 @@ export function apply(ctx, config = {}) {
   }
 
   const injector = createInjector({ lookup, log: (message) => logLine(logPath, message) })
+  let lastRouteState = ''
 
   async function once(reason) {
     if (running) return
@@ -581,6 +583,15 @@ export function apply(ctx, config = {}) {
       } catch (error) {
         logLine(logPath, `inject 挂载异常: ${String(error?.message ?? error)}`)
       }
+      try {
+        const routed = hookWebServer(ctx)
+        if (routed !== lastRouteState) {
+          lastRouteState = routed
+          logLine(logPath, `webServer: ${routed}`)
+        }
+      } catch (error) {
+        logLine(logPath, `webServer 钩子异常: ${String(error?.message ?? error)}`)
+      }
     }, delay)
     handle.unref?.()
     return handle
@@ -638,4 +649,192 @@ export function apply(ctx, config = {}) {
   ctx.on('plugin-manager/changed', () => {
     setTimeout(() => void once('changed'), 1_500).unref?.()
   })
+}
+
+// ---- 市场详情页 README 的中文化：包一层 webServer.register --------------------
+// dsh-m 的 /dshm 路由在 action==='readme' 时把包目录里的 README.md 原样吐给前端，
+// 前端直接渲染 Markdown。这里在响应落地前把 readme 字段换成中文。
+const ROUTE_HOOKED = Symbol.for('dsh-plugin-chinese#route')
+const README_PATHS = new Set(['/dshm', '/dshm/api', '/dsh-market'])
+
+function hookWebServer(ctx) {
+  const server = ctx.get('webServer')
+  if (server === undefined || server === null) return 'missing'
+  let hooked = 0
+  let matched = 0
+  // 已注册的路由：直接换掉表里的 handler，请求时是现取的，改完立刻生效。
+  for (const table of [server.exact, server.prefixes]) {
+    if (table === undefined || typeof table?.get !== 'function') continue
+    for (const [path, route] of table) {
+      if (!README_PATHS.has(path)) continue
+      if (route === undefined || typeof route.handler !== 'function') continue
+      matched += 1
+      if (route.handler[ROUTE_HOOKED] === true) continue
+      try {
+        const wrapped = wrapMarketHandler(route.handler, ctx)
+        wrapped[ROUTE_HOOKED] = true
+        route.handler = wrapped
+        hooked += 1
+      } catch (error) {
+        logLine(logPath, `webServer 接管失败: ${String(error?.message ?? error)}`)
+      }
+    }
+  }
+  // 之后才注册的同名路由也拦得住。
+  if (typeof server.register === 'function' && server.register[ROUTE_HOOKED] !== true) {
+    const original = server.register.bind(server)
+    const patched = function (route) {
+      try {
+        if (README_PATHS.has(route?.path) && typeof route?.handler === 'function') {
+          const wrapped = wrapMarketHandler(route.handler, ctx)
+          wrapped[ROUTE_HOOKED] = true
+          return original({ ...route, handler: wrapped })
+        }
+      } catch (error) {
+        logLine(logPath, `webServer 注册钩子异常: ${String(error?.message ?? error)}`)
+      }
+      return original(route)
+    }
+    patched[ROUTE_HOOKED] = true
+    try { server.register = patched } catch {}
+  }
+  return matched > 0 ? `已接管 ${matched} 条市场路由` : '暂无可接管路由'
+}
+
+function wrapMarketHandler(handler, ctx) {
+  return function (req, res) {
+    const chunks = []
+    let status = 200
+    const headers = {}
+    const fake = {
+      setHeader(name, value) { headers[String(name).toLowerCase()] = value },
+      getHeader(name) { return headers[String(name).toLowerCase()] },
+      writeHead(code, hdrs) { status = code; if (hdrs) for (const [k, v] of Object.entries(hdrs)) headers[k.toLowerCase()] = v; return fake },
+      write(chunk) { if (chunk !== undefined) chunks.push(Buffer.from(chunk)); return true },
+      end(chunk) {
+        if (chunk !== undefined) chunks.push(Buffer.from(chunk))
+        void finish(req, res, status, headers, Buffer.concat(chunks).toString('utf8'), ctx)
+        return fake
+      },
+      on() { return fake },
+      once() { return fake },
+      emit() { return false },
+      get statusCode() { return status },
+      set statusCode(v) { status = v },
+    }
+    try {
+      handler(req, fake)
+    } catch (error) {
+      logLine(logPath, `市场路由异常: ${String(error?.message ?? error)}`)
+      try { res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' }); res.end('{"ok":false,"error":"route failed"}') } catch {}
+    }
+  }
+}
+
+async function finish(req, res, status, headers, body, ctx) {
+  let payload = null
+  try { payload = JSON.parse(body) } catch {}
+  try {
+    if (payload !== null && typeof payload.readme === 'string' && payload.readme.trim() !== '') {
+      const translator = ctx?.get?.('translator')
+      const zh = await chineseReadme(translator, payload.pkg ?? payload.name ?? '', payload.readme)
+      if (zh !== payload.readme) payload.readme = zh
+    }
+  } catch (error) {
+    logLine(logPath, `README 翻译失败: ${String(error?.message ?? error)}`)
+  }
+  const out = payload === null ? body : JSON.stringify(payload)
+  try {
+    res.writeHead(status, { ...headers, 'content-length': Buffer.byteLength(out) })
+    res.end(out)
+  } catch (error) {
+    logLine(logPath, `市场响应回写失败: ${String(error?.message ?? error)}`)
+  }
+}
+
+// ---- README 中文化本体 ------------------------------------------------------
+const README_CHUNK = 2500          // 每段送翻译的字数
+const README_GAP_MS = 500          // 段间隔
+const README_MAX = 24000           // 单次最多翻这么多，超出部分保留原文
+const README_NOTE = '\n\n---\n\n> 以上为机器翻译；超出 24000 字的部分保留英文原文。\n'
+
+const readmeMemo = new Map()
+
+/** 状态目录里的 README 译文缓存；这里现算而不是用 apply 里的局部变量。 */
+function readmeCacheFile() {
+  const home = process.env.DSH_HOME ?? join(process.env.USERPROFILE ?? process.env.HOME ?? '.', '.dsh')
+  return join(home, 'auto-i18n', 'readme-cache.json')
+}
+
+function protectMarkdown(text) {
+  const saved = []
+  const keep = (value) => {
+    saved.push(value)
+    return `\u00a7${saved.length - 1}\u00a7`
+  }
+  let out = text
+  out = out.replace(/```[\s\S]*?```/g, keep)                 // 围栏代码块
+  out = out.replace(/`[^`\n]*`/g, keep)                      // 行内代码
+  out = out.replace(/<(?:[^<>\n]{1,200})>/g, keep)           // HTML 标签
+  out = out.replace(/https?:\/\/[^\s)\]>]+/g, keep)          // 裸链接
+  out = out.replace(/\]\([^)\n]*\)/g, (m) => '](' + keep(m.slice(2, -1)) + ')')  // 链接目标
+  out = out.replace(/^#{1,6}\s+/gm, keep)                    // 标题井号
+  out = out.replace(/^\s*[-*+]\s+/gm, keep)                  // 列表符号
+  out = out.replace(/^\s*\d+\.\s+/gm, keep)                  // 有序列表
+  return { text: out, saved }
+}
+
+function restoreMarkdown(text, saved) {
+  return text.replace(/\u00a7(\d+)\u00a7/g, (m, i) => saved[Number(i)] ?? m)
+}
+
+function chunkPlain(text, size) {
+  if (text.length <= size) return [text]
+  const chunks = []
+  let rest = text
+  while (rest.length > size) {
+    let cut = rest.lastIndexOf('\n\n', size)
+    if (cut < size * 0.5) cut = rest.lastIndexOf('\n', size)
+    if (cut < size * 0.5) cut = rest.lastIndexOf('. ', size)
+    if (cut < size * 0.5) cut = size
+    chunks.push(rest.slice(0, cut))
+    rest = rest.slice(cut)
+  }
+  if (rest !== '') chunks.push(rest)
+  return chunks
+}
+
+/** 把一个包的 README 变成中文；命中缓存直接返回。进程内也做一层 memo。 */
+export async function chineseReadme(translator, pkg, markdown) {
+  const text = String(markdown ?? '')
+  if (text.trim() === '') return text
+  if (isChinese(text)) return text
+  if (translator === undefined || translator === null) return text
+
+  const cacheKey = pkg + '#' + createHash('sha1').update(text).digest('hex').slice(0, 16)
+  const memo = readmeMemo.get(cacheKey)
+  if (memo !== undefined) return memo
+  const disk = readJson(readmeCacheFile(), {})
+  if (typeof disk[cacheKey] === 'string') {
+    readmeMemo.set(cacheKey, disk[cacheKey])
+    return disk[cacheKey]
+  }
+
+  const clipped = text.length > README_MAX ? text.slice(0, README_MAX) : text
+  const { text: guarded, saved } = protectMarkdown(clipped)
+  const pieces = []
+  for (const chunk of chunkPlain(guarded, README_CHUNK)) {
+    if (chunk.trim() === '') { pieces.push(chunk); continue }
+    const spec = translator.resolve({ text: chunk, targetLanguage: 'zh-CN', sourceLanguage: 'en' })
+    pieces.push(await translator.translate(spec))
+    if (README_GAP_MS > 0) await new Promise((r) => setTimeout(r, README_GAP_MS))
+  }
+  let zh = polishDescription(restoreMarkdown(pieces.join(''), saved))
+  if (text.length > README_MAX) zh += README_NOTE
+  if (!isChinese(zh)) return text
+  readmeMemo.set(cacheKey, zh)
+  const store = readJson(readmeCacheFile(), {})
+  store[cacheKey] = zh
+  writeJsonAtomic(readmeCacheFile(), store)
+  return zh
 }
