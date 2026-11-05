@@ -1,6 +1,6 @@
-{
+﻿{
   "name": "dsh-plugin-chinese",
-  "version": "1.2.2",
+  "version": "1.3.0",
   "type": "module",
   "description": "给每个已安装的 DSH 插件自动补上中文功能简介。插件名一律保持原样，只翻译简介，方便按名字找插件。",
   "license": "MIT",
