@@ -29,6 +29,9 @@ export const inject = []
 /** 中文判定：出现这些区间的字符就当它已经是中文，无需再翻。 */
 const CJK = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/
 
+/** 本插件自己的包名：扫描时跳过它，也用它来认出「哪个 profile 装着本插件」。 */
+const OWN_PACKAGE = 'dsh-plugin-chinese'
+
 /** 一句话里至少要有这么多汉字，才有资格被当成中文（纯英文的 0 个直接排除）。 */
 const CJK_ENOUGH = 4
 
@@ -217,7 +220,7 @@ export async function sweep({ profileDir, translator, cache, cachePath, log, con
   const deps = Object.keys(profileManifest.dependencies ?? {})
 
   for (const packageName of deps) {
-    if (packageName === 'dsh-plugin-chinese') continue // 自己不动自己
+    if (packageName === OWN_PACKAGE) continue // 自己不动自己
     const packageDir = join(profileDir, 'node_modules', ...packageName.split('/'))
     const own = join(packageDir, 'package.json')
     if (!existsSync(own)) continue
@@ -357,14 +360,83 @@ export function ensureLocaleExport(manifestPath, manifest, localeDir) {
   return true
 }
 
+/** 日志超过这个体积就裁剪，只留最后 200 行。自检每分钟一行，不裁剪会无限长。 */
+const MAX_LOG_BYTES = 1_048_576
+
 function logLine(logPath, message) {
   try {
     mkdirSync(dirname(logPath), { recursive: true })
+    try {
+      if (statSync(logPath).size > MAX_LOG_BYTES) {
+        const kept = readFileSync(logPath, 'utf8').split('\n').slice(-200).join('\n')
+        writeFileSync(logPath, kept, { encoding: 'utf8' })
+      }
+    } catch {
+      /* 第一次写日志时文件还不存在，正常 */
+    }
     const stamp = new Date().toISOString()
     writeFileSync(logPath, `${stamp} ${message}\n`, { encoding: 'utf8', flag: 'a' })
   } catch {
     // 日志失败不能影响主流程。
   }
+}
+
+/**
+ * 找到当前宿主真正在用的 profile 目录。
+ *
+ * 判定依据按可靠性排序：
+ * 1. `DSH_PROFILE_DIR` —— 宿主直接告诉我们的（有些启动方式不会设）。
+ * 2. `$DSH_HOME/profiles/*` 里，`dependencies` 声明了本插件的那个 —— 最确定。
+ * 3. 从模块位置逐级上溯，找同时有 `cordis.patch.yml` 和 `package.json` 的目录。
+ * 4. 兜底 `$DSH_HOME/profiles/<DSH_PROFILE ?? 'desktop'>`。
+ *
+ * 全都对不上时返回 `undefined`：宁可让 report 里留一条明确的失败，也不瞎猜一个目录去写文件。
+ */
+export function resolveProfileDir(home, moduleUrl = import.meta.url) {
+  const profilesDir = join(home, 'profiles')
+  const isProfile = (dir) => {
+    if (typeof dir !== 'string' || dir === '') return false
+    try {
+      if (!existsSync(join(dir, 'cordis.patch.yml'))) return false
+      const manifest = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'))
+      return manifest !== null && typeof manifest === 'object' && typeof manifest.dependencies === 'object'
+    } catch {
+      return false
+    }
+  }
+  const declaresOwnPackage = (dir) => {
+    try {
+      const manifest = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'))
+      return manifest?.dependencies?.[OWN_PACKAGE] !== undefined
+    } catch {
+      return false
+    }
+  }
+
+  const fromEnv = process.env.DSH_PROFILE_DIR
+  if (isProfile(fromEnv)) return fromEnv
+
+  const candidates = []
+  try {
+    for (const entry of readdirSync(profilesDir, { withFileTypes: true })) {
+      if (entry.isDirectory()) candidates.push(join(profilesDir, entry.name))
+    }
+  } catch {
+    /* 没有 profiles 目录：交给下面的上溯 */
+  }
+  for (const dir of candidates) if (declaresOwnPackage(dir)) return dir
+
+  let cursor = dirname(fileURLToPath(moduleUrl))
+  for (let depth = 0; depth < 8; depth += 1) {
+    if (isProfile(cursor)) return cursor
+    const parent = dirname(cursor)
+    if (parent === cursor) break
+    cursor = parent
+  }
+
+  const named = join(profilesDir, process.env.DSH_PROFILE ?? 'desktop')
+  if (isProfile(named)) return named
+  return candidates.find(isProfile)
 }
 
 export const Config = Schema.object({
@@ -389,9 +461,16 @@ export function apply(ctx, config = {}) {
   const logPath = join(stateDir, 'auto-i18n.log')
   const reportPath = join(stateDir, 'report.json')
 
-  // profile 目录：优先用宿主注入的环境变量，其次从本插件的安装位置推断。
-  const profileDir =
-    process.env.DSH_PROFILE_DIR ?? resolvePath(dirname(fileURLToPath(import.meta.url)), '..', '..')
+  // profile 目录。
+  //
+  // 这里绝不能只靠 `import.meta.url` 上溯两级：当插件被 `file:` 关联进 profile 时，
+  // 模块的真实位置在工作区源码里，上溯两级会落到一个没有 package.json 的目录，
+  // 于是扫描全部失败（历史 bug：scanned 0，failed「无法读取 …\DSH\package.json」）。
+  // 现在的顺序是：环境变量 → 扫描 $DSH_HOME/profiles 找「依赖里写了我」的那一个
+  // → 从模块位置逐级上溯找长得像 profile 的目录 → 兜底猜 desktop。
+  const profileDir = resolveProfileDir(home)
+  if (profileDir !== undefined) logLine(logPath, `profile 目录: ${profileDir}`)
+  else logLine(logPath, 'profile 目录没找到：本次只跑内存注入层，不会往磁盘写语言包')
 
   let running = false
   let timer
@@ -419,7 +498,8 @@ export function apply(ctx, config = {}) {
 
   function lookup(name) {
     const packageName = packageNameOf(name)
-    if (packageName === undefined || packageName === 'dsh-plugin-chinese') return undefined
+    if (packageName === undefined || packageName === OWN_PACKAGE) return undefined
+    if (profileDir === undefined) return undefined
     const packageDir = join(profileDir, 'node_modules', ...packageName.split('/'))
     const manifestPath = join(packageDir, 'package.json')
     if (!existsSync(manifestPath)) return undefined
@@ -438,6 +518,20 @@ export function apply(ctx, config = {}) {
 
   async function once(reason) {
     if (running) return
+    if (profileDir === undefined) {
+      writeJsonAtomic(reportPath, {
+        at: new Date().toISOString(),
+        reason,
+        scanned: 0,
+        translated: [],
+        skipped: [],
+        failed: [{ package: '(profile)', reason: '找不到 profile 目录，无法扫描' }],
+        restartNeeded: [],
+        inject: injector.status,
+        injectCalls: injector.counters,
+      })
+      return
+    }
     running = true
     try {
       const cache = readJson(cachePath, {})
@@ -481,8 +575,12 @@ export function apply(ctx, config = {}) {
   // 注入层稍晚一点装：等 pluginPackages / pluginManager 都就位。
   const injectTimers = [3_000, 8_000, 20_000].map((delay) => {
     const handle = setTimeout(() => {
-      injector.install(ctx)
-      if (!injector.anyInstalled) logLine(logPath, 'inject: 还没有可挂载的服务，稍后重试')
+      try {
+        injector.install(ctx)
+        if (!injector.anyInstalled) logLine(logPath, 'inject: 还没有可挂载的服务，稍后重试')
+      } catch (error) {
+        logLine(logPath, `inject 挂载异常: ${String(error?.message ?? error)}`)
+      }
     }, delay)
     handle.unref?.()
     return handle
@@ -490,11 +588,15 @@ export function apply(ctx, config = {}) {
 
   // 自检探针：光看计数器只能证明「皮被调到了」，证明不了「拿到的 meta 真是中文」。
   // 所以这里自己调一次 listBundles，直接数返回结果里有几条带 zh。
-  let lastCalls = -1
+  let probeTicks = 0
+  // 上一次探针的基线值；必须显式声明，否则严格模式下读取会抛
+  // ReferenceError: lastProbeHits is not defined，直接把宿主启动搞挂。
   let lastProbeHits = -1
+  let lastCalls = -1
   const callWatch = setInterval(() => {
     void (async () => {
       if (!injector.anyInstalled) return
+      probeTicks += 1
       const counts = injector.counters
       const total = Object.values(counts).reduce((sum, n) => sum + n, 0)
       const result = await injector.probe()
@@ -502,11 +604,21 @@ export function apply(ctx, config = {}) {
         `inject 自检: 调用合计 ${total} 次 ` +
         `[${Object.entries(counts).map(([k, v]) => `${k}=${v}`).join(', ')}]` +
         ` / 探针 ${result.service} 自增 ${result.calls} 次、${result.hit}/${result.total} 条带 zh`
-      if (total === lastCalls && result.hit === lastProbeHits) return
+      // 只有「带 zh 的条数」变了才值得记一行；否则半小时留一条心跳就够，
+      // 免得日志每分钟涨一行（历史上曾涨到 2 MB）。
+      const changed = result.hit !== lastProbeHits
+      const heartbeat = probeTicks % 30 === 0
+      if (!changed && !heartbeat) {
+        lastCalls = total
+        return
+      }
       lastCalls = total
       lastProbeHits = result.hit
       logLine(logPath, result.hit > 0 ? line : `${line} —— 注入没落地`)
-    })()
+    })().catch((error) => {
+      // 自检写错也不能把宿主带崩：这里必须兜住。
+      logLine(logPath, `inject 自检异常: ${String(error?.message ?? error)}`)
+    })
   }, 60_000)
   callWatch.unref?.()
 
